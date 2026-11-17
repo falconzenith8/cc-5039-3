@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <link rel="icon" href="favicon.svg" type="image/svg+xml" />
+  <title>MSE 内核端到端测试</title>
+  <link rel="stylesheet" href="css/styles.css" />
+  <style>
+    body { padding: 24px; }
+    .case { border: 1px solid var(--line); border-radius: 10px; padding: 12px 16px; margin: 10px 0; background: var(--card); }
+    .case h3 { margin: 0 0 6px; font-size: 14px; }
+    .case .status { font-weight: 700; }
+    .pass .status { color: var(--ok); }
+    .fail .status { color: var(--error); }
+    .running .status { color: var(--warn); }
+    .detail { color: var(--muted); font-size: 12px; white-space: pre-wrap; margin-top: 6px; }
+    video { width: 320px; background: #000; border-radius: 8px; }
+    .toolbar { display: flex; gap: 10px; align-items: center; margin-bottom: 16px; }
+    #summary { font-size: 16px; font-weight: 700; }
+  </style>
+</head>
+<body>
+  <h1>MSE 分片缓冲内核 · 端到端测试</h1>
+  <div class="toolbar">
+    <button id="run" class="primary">运行全部用例</button>
+    <span id="summary">未运行</span>
+  </div>
+  <video id="test-video" muted playsinline></video>
+  <div id="cases"></div>
+  <script type="module" src="js/test-suite.js"></script>
+</body>
+</html>

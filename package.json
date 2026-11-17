@@ -1,0 +1,17 @@
+{
+  "name": "mse-segmented-player",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Browser MSE segmented playback kernel with serial SourceBuffer coordination, range-truth buffering and quota-aware eviction",
+  "scripts": {
+    "media": "bash scripts/build_media.sh",
+    "serve": "python3 server.py",
+    "test:unit": "node test/kernel/unit.test.mjs",
+    "test:e2e": "node test/e2e/run-browser.mjs",
+    "test": "npm run test:unit && npm run test:e2e"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

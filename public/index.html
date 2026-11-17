@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link rel="icon" href="favicon.svg" type="image/svg+xml" />
+  <title>MSE 分片播放内核 · 浏览器缓冲演示</title>
+  <link rel="stylesheet" href="css/styles.css" />
+</head>
+<body>
+<header class="topbar">
+  <h1>MSE 分片播放内核</h1>
+  <p class="sub">MediaSource + 双 SourceBuffer · 串行追加 · 真实缓冲范围驱动控件</p>
+</header>
+
+<main class="layout">
+  <section class="player-card">
+    <video id="video" muted playsinline preload="auto"></video>
+
+    <div class="controls">
+      <button id="btn-play" class="primary">播放</button>
+      <button id="btn-pause">暂停</button>
+      <button id="btn-seek0">回开头</button>
+      <div class="seek-wrap">
+        <label for="seek">进度拖动</label>
+        <input id="seek" type="range" min="0" max="60" step="0.1" value="0" />
+        <span id="seek-label">0.0 / 60.0 s</span>
+      </div>
+    </div>
+
+    <canvas id="timeline" height="110" aria-label="缓冲范围时间线"></canvas>
+    <div class="legend">
+      <span><i class="sw video"></i>视频 buffered（浏览器报告）</span>
+      <span><i class="sw audio"></i>音频 buffered（浏览器报告）</span>
+      <span><i class="sw intersection"></i>音视频交集＝实际可连续播放</span>
+      <span><i class="sw playhead"></i>播放头</span>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>网络注入</h2>
+    <div class="grid2">
+      <label>基础延迟 ms
+        <input id="latency-base" type="number" min="0" step="50" value="0" />
+      </label>
+      <label>随机抖动 ms
+        <input id="latency-jitter" type="number" min="0" step="50" value="0" />
+      </label>
+      <label>失败率 0–1（503）
+        <input id="fail-rate" type="number" min="0" max="1" step="0.1" value="0" />
+      </label>
+      <label>截断率 0–1（短字节）
+        <input id="truncate-rate" type="number" min="0" max="1" step="0.1" value="0" />
+      </label>
+    </div>
+    <div class="btn-row">
+      <button id="btn-apply-knobs">应用注入</button>
+      <button id="btn-reset-knobs">重置</button>
+      <button id="btn-one-fail" class="warn">下一分片失败一次</button>
+      <button id="btn-one-truncate" class="warn">下一分片截断一次</button>
+    </div>
+    <p class="hint">失败在下载层有界重试；截断字节通常导致 SourceBuffer 解码错误，内核进入可解释 ERROR，可点“恢复”而非无限重试。</p>
+  </section>
+
+  <section class="panel">
+    <h2>浏览器缓冲内核状态</h2>
+    <div id="state-grid" class="state-grid"></div>
+    <div id="fatal-box" class="fatal hidden">
+      <strong>内核 ERROR：</strong><span id="fatal-msg"></span>
+      <button id="btn-resume" class="primary">恢复调度（resume）</button>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>下载 / 追加队列（实时）</h2>
+    <pre id="queue-view" class="mono"></pre>
+    <h2>统计</h2>
+    <pre id="stats-view" class="mono"></pre>
+  </section>
+
+  <section class="panel log-panel">
+    <h2>事件日志 <button id="btn-clear-log" class="small">清空</button></h2>
+    <ol id="event-log" class="mono"></ol>
+  </section>
+
+  <section class="panel">
+    <h2>自动化端到端测试</h2>
+    <p class="hint">同一内核在 <code>/test.html</code> 下由断言驱动：短分片、重复追加去重、下载错误恢复、截断解码错误、配额回收、seek、延迟卡顿、资源释放。</p>
+    <a class="linkbtn" href="/test.html" target="_blank" rel="noopener">打开测试页 /test.html</a>
+  </section>
+</main>
+
+<script type="module" src="js/app.js"></script>
+</body>
+</html>
