@@ -60,9 +60,12 @@ export class MsePlayer extends Evented {
     this.downloads = new DownloadManager(options.download || {});
     this._downloaded = new Set();     // keys successfully fetched
     this._appended = new Set();       // keys durably inside a SourceBuffer
-    this._appendQueue = [];           // {kind, index, data} awaiting append
+    this._appendQueue = [];           // {kind, index, data, epoch} awaiting append
     this._cursor = { video: 0, audio: 0 }; // next index each track needs
     this._demandAnchor = 0; // seek target while SEEKING; otherwise mirrors currentTime
+    this._seekEpoch = 0;    // bumped on every seek; stale downloads/appends carry an old epoch
+    this._draining = false; // single-writer guard for the append queue
+    this._drainChain = Promise.resolve(); // drains chain behind the in-flight writer
     this._pumpScheduled = false;
     this._tickTimer = null;
     this._lastCurrentTime = 0;
@@ -157,31 +160,43 @@ export class MsePlayer extends Evented {
   // Seek moves the demand window. In-flight downloads outside the new window
   // are aborted; buffered data is retained and reused where it overlaps.
   seekTo(time) {
-    if (this._disposed) return;
+    if (this._disposed || this.state === PlayerState.ERROR ||
+        this.state === PlayerState.ENDED || !this.manifest) {
+      return;
+    }
     const clamped = Math.max(0, Math.min(time, this.manifest.durationSec));
+    this._seekEpoch++;
+    const epoch = this._seekEpoch;
     this._transition(PlayerState.SEEKING);
     this._endOfStreamed = false;
+    // Drop queued items that never reached a SourceBuffer. An append already
+    // owned by a buffer cannot be undone; it is neutralized by epoch checks
+    // when it settles instead of being trusted as post-seek state.
     this._appendQueue = [];
 
+    const windowEnd = clamped + this.options.aheadLimitSec;
     for (const kind of ['video', 'audio']) {
       const segs = this.manifest.tracks[kind].segments;
       const idx = segs.findIndex((s) => clamped >= s.timeStart && clamped < s.timeEnd);
       this._cursor[kind] = idx === -1 ? segs.length - 1 : idx;
     }
-    // Abort downloads that no longer belong to the post-seek window.
+    // Abort every in-flight download outside the post-seek window, in either
+    // direction: both backward seeks (old forward fetches) and forward seeks
+    // past the prefetch horizon must be cancelled.
     for (const key of this.downloads.inflightKeys) {
       const [kind, raw] = key.split(':');
       if (raw === 'init') continue;
       const index = Number(raw);
-      if (!Number.isInteger(index) || index < this._cursor[kind]) {
-        this.downloads.abortKey(key);
-      }
+      const seg = this.manifest.tracks[kind]?.segments[index];
+      const outside = !seg || seg.timeEnd <= clamped || seg.timeStart >= windowEnd;
+      if (outside) this.downloads.abortKey(key);
     }
     this.video.currentTime = clamped;
     this._demandAnchor = clamped;
     this._lastCurrentTime = clamped;
     this._lastProgressAt = performance.now();
     this._pump();
+    return epoch;
   }
 
   // Re-arm after a recoverable ERROR: clear the fatal flag and resume scheduling.
@@ -248,19 +263,20 @@ export class MsePlayer extends Evented {
 
   async _runPump() {
     if (!this.manifest) return;
+    const epoch = this._seekEpoch;
     await this._drainAppendQueue();
-    if (this.state === PlayerState.ERROR) return;
+    if (this.state === PlayerState.ERROR || epoch !== this._seekEpoch) return;
 
     const plan = this._planDownloads();
     if (plan.length === 0) {
       this._maybeEndStream();
       return;
     }
-    await this._downloadAndAppend(plan);
-    if (this.state !== PlayerState.ERROR) {
-      await this._enforceHighWatermark();
-      this._maybeEndStream();
-    }
+    await this._downloadAndAppend(plan, epoch);
+    if (this.state === PlayerState.ERROR) return;
+    if (epoch !== this._seekEpoch) return; // a seek superseded this cycle
+    await this._enforceHighWatermark();
+    this._maybeEndStream();
   }
 
   // Decide which segment indices to fetch. Video leads; audio is paired to the
@@ -278,13 +294,16 @@ export class MsePlayer extends Evented {
 
     const vSegs = this.manifest.tracks.video.segments;
     const aSegs = this.manifest.tracks.audio.segments;
+    const queuedKeys = new Set(this._appendQueue.map((i) => `${i.kind}:${i.index}`));
     const needed = (kind, segs) => {
       const out = [];
       for (let i = this._cursor[kind]; i < segs.length; i++) {
         const seg = segs[i];
         if (seg.timeStart >= horizon) break;
         const key = `${kind}:${i}`;
-        if (this._appended.has(key) || this.downloads.isInflight(key)) continue;
+        if (this._appended.has(key) || this.downloads.isInflight(key) || queuedKeys.has(key)) {
+          continue;
+        }
         out.push({ kind, index: i, seg });
       }
       return out;
@@ -302,14 +321,18 @@ export class MsePlayer extends Evented {
     return plan;
   }
 
-  async _downloadAndAppend(plan) {
+  async _downloadAndAppend(plan, epoch) {
     const downloads = plan.map(async (item) => {
       const key = `${item.kind}:${item.index}`;
       const url = new URL(item.seg.url, this._manifestUrl).href;
       try {
         const data = await this.downloads.fetch(key, url);
+        // A seek while this fetch was in flight superseded it. The bytes may
+        // still be valid for an overlapping window, but bookkeeping must be
+        // decided by the current planner rather than trusted blindly.
+        if (epoch !== this._seekEpoch) return null;
         this._downloaded.add(key);
-        return { ...item, data };
+        return { ...item, data, epoch };
       } catch (err) {
         if (err.name === 'AbortError') return null; // seek superseded this fetch
         this._fatalNow(err.message, err);
@@ -317,32 +340,85 @@ export class MsePlayer extends Evented {
       }
     });
     const settled = (await Promise.all(downloads)).filter(Boolean);
+    if (epoch !== this._seekEpoch) return;
     // Append in deterministic index order per track even if downloads resolved
     // out of order; appendBuffer with sequence-agnostic fMP4 tolerates this,
     // but ordered appends keep decode dependencies intact.
     settled.sort((a, b) => a.index - b.index || a.kind.localeCompare(b.kind));
-    for (const item of settled) this._appendQueue.push(item);
+    // Two pump cycles can plan the same key before either reaches the buffer
+    // (the drain chain serializes appends, not planning). Dedupe against both
+    // the live queue and durably appended keys so a segment is appended once.
+    const queuedKeys = new Set(this._appendQueue.map((i) => `${i.kind}:${i.index}`));
+    for (const item of settled) {
+      const key = `${item.kind}:${item.index}`;
+      if (queuedKeys.has(key) || this._appended.has(key)) continue;
+      queuedKeys.add(key);
+      this._appendQueue.push(item);
+    }
     await this._drainAppendQueue();
     this._pump();
   }
 
-  async _drainAppendQueue() {
-    while (this._appendQueue.length) {
-      const item = this._appendQueue[0];
-      const key = `${item.kind}:${item.index}`;
-      try {
-        await this._appendWithQuotaRecovery(item);
-        this._appendQueue.shift();
-        this._appended.add(key);
-        this._cursor[item.kind] = Math.max(this._cursor[item.kind], item.index + 1);
-        this._stats.appends++;
-        this.emit('bufferedchange', this.getRanges());
-      } catch (err) {
-        // Keep the failing item at the head so state stays explainable; enter
-        // ERROR rather than silently dropping or endlessly retrying.
-        this._stats.appendErrors++;
-        this._fatalNow(err.message, err);
-        return;
+  // Drain requests chain behind the current writer instead of being dropped:
+  // a seek's pump must still run once the in-flight (superseded) append settles.
+  _drainAppendQueue() {
+    const run = this._drainChain.then(() => this._runDrain());
+    // Swallow the chain's own rejections here; _runDrain already routes real
+    // failures through _fatalNow, and a broken link must not block later drains.
+    this._drainChain = run.then(() => undefined, () => undefined);
+    return run;
+  }
+
+  async _runDrain() {
+    this._draining = true;
+    let superseded = false;
+    try {
+      while (this._appendQueue.length) {
+        // A seek replaced the whole queue while we awaited an in-flight append.
+        // Stop touching items we do not own; a chained drain (requested by the
+        // seek's pump) picks up the fresh queue once we release the writer.
+        if (this._appendQueue[0].epoch !== this._seekEpoch) {
+          superseded = true;
+          return;
+        }
+        const item = this._appendQueue[0];
+        const key = `${item.kind}:${item.index}`;
+        const appendEpoch = this._seekEpoch;
+        try {
+          await this._appendWithQuotaRecovery(item);
+          this._appendQueue.shift();
+          this._appended.add(key); // bytes physically landed: always dedupe
+          this._stats.appends++;
+          if (appendEpoch === this._seekEpoch) {
+            this._cursor[item.kind] = Math.max(this._cursor[item.kind], item.index + 1);
+            this.emit('bufferedchange', this.getRanges());
+          }
+          // Stale epoch: the append was already owned by the SourceBuffer when
+          // the seek happened and cannot be revoked. The bytes remain in the
+          // real buffered ranges (planner dedupes via _appended), but they must
+          // not advance the post-seek cursor or fake a bufferedchange.
+        } catch (err) {
+          if (appendEpoch !== this._seekEpoch) {
+            // A seek superseded a failing in-flight append; the new cycle owns
+            // recovery. Drop the stale head instead of entering ERROR for a
+            // demand the player no longer has.
+            this._appendQueue.shift();
+            superseded = true;
+            return;
+          }
+          // Keep the failing item at the head so state stays explainable; enter
+          // ERROR rather than silently dropping or endlessly retrying.
+          this._stats.appendErrors++;
+          this._fatalNow(err.message, err);
+          return;
+        }
+      }
+    } finally {
+      this._draining = false;
+      // The seek's pump chained a drain while we held the writer. Re-arm the
+      // scheduler so the post-seek queue is processed rather than left waiting.
+      if (superseded && !this._disposed && this.state !== PlayerState.ERROR) {
+        this._pump();
       }
     }
   }
@@ -430,6 +506,12 @@ export class MsePlayer extends Evented {
 
   _maybeEndStream() {
     if (this._endOfStreamed || !this.manifest) return;
+    // Eligibility: endOfStream is only valid while the MediaSource is open and
+    // the player is not mid-seek (the seek's own pump finalizes scheduling).
+    if (!this.mediaSource || this.mediaSource.readyState !== 'open' ||
+        this.state === PlayerState.SEEKING || this.state === PlayerState.ERROR) {
+      return;
+    }
     const vDone = this._cursor.video >= this.manifest.tracks.video.segments.length;
     const aDone = this._cursor.audio >= this.manifest.tracks.audio.segments.length;
     const queuesIdle = Object.values(this.queues).every((q) => !q.updating);
@@ -440,6 +522,7 @@ export class MsePlayer extends Evented {
         this.mediaSource.endOfStream();
         this.emit('endofstream');
       } catch (err) {
+        this._endOfStreamed = false;
         this._fatalNow(`endOfStream failed: ${err.message}`, err);
       }
     }
@@ -539,7 +622,12 @@ export class MsePlayer extends Evented {
       }
     }
 
-    this._enforceHighWatermark().catch((err) => this._fatalNow(err.message, err));
+    // Eviction is itself a SourceBuffer mutation: never run it while the append
+    // queue owns a drain, or remove() could be enqueued against the same buffer
+    // from a scheduling cycle a seek has since superseded.
+    if (!this._draining && this.state !== PlayerState.SEEKING) {
+      this._enforceHighWatermark().catch((err) => this._fatalNow(err.message, err));
+    }
     this._pump();
     this.emit('tick', this.getState());
   }

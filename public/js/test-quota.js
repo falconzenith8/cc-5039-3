@@ -117,7 +117,7 @@ async function main() {
     fakeV.appends = 8; fakeA.appends = 8;
     p.video.currentTime = 5;
     fakeV.failQuotaOnce = 1;
-    p._appendQueue.push({ kind: 'video', index: 8, data: new Uint8Array([1]) });
+    p._appendQueue.push({ kind: 'video', index: 8, data: new Uint8Array([1]), epoch: p._seekEpoch });
     await p._drainAppendQueue();
     record('配额错误：回收后同片重试一次成功', () => {
       assert(p.state !== PlayerState.ERROR, '不应进入 ERROR，实际 ' + p.state);
@@ -134,7 +134,7 @@ async function main() {
     p.queues.audio = new SourceBufferQueue(fakeA, 'audio');
     p.video.currentTime = 0;
     fakeV.failQuotaOnce = 1;
-    p._appendQueue.push({ kind: 'video', index: 0, data: new Uint8Array([1]) });
+    p._appendQueue.push({ kind: 'video', index: 0, data: new Uint8Array([1]), epoch: p._seekEpoch });
     await p._drainAppendQueue();
     record('无法回收时：配额失败进入可解释 ERROR', () => {
       assert(p.state === PlayerState.ERROR, '应进入 ERROR，实际 ' + p.state);
@@ -160,7 +160,7 @@ async function main() {
         queueMicrotask(() => { this._emit('error'); this._emit('updateend'); });
       });
     };
-    p._appendQueue.push({ kind: 'video', index: 9, data: new Uint8Array([1]) });
+    p._appendQueue.push({ kind: 'video', index: 9, data: new Uint8Array([1]), epoch: p._seekEpoch });
     await p._drainAppendQueue();
     record('非配额错误：不回收、直接 ERROR', () => {
       assert(p.state === PlayerState.ERROR, '应进入 ERROR');

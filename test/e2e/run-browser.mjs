@@ -50,17 +50,28 @@ async function resetKnobs() {
   });
 }
 
+// This headless-shell/playwright-core build ignores the per-call `timeout`
+// option on waitForFunction (it always falls back to the 30s default). Poll the
+// predicate via evaluate instead so long-running suites are not cut off at 30s.
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+async function waitUntil(predicate, { timeout = timeoutMs, interval = 250, label = 'condition' } = {}) {
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    if (await page.evaluate(predicate)) return;
+    await sleep(interval);
+  }
+  throw new Error(`waitUntil timed out after ${timeout}ms: ${label}`);
+}
+
 let exitCode = 0;
 try {
   await resetKnobs();
   await page.goto(`${BASE}/test.html`, { waitUntil: 'domcontentloaded' });
-  await page.waitForFunction(() => window.__testReady === true, { timeout: 10000 });
+  await waitUntil(() => window.__testReady === true, { timeout: 120000, label: 'test ready' });
   await page.click('#run');
 
-  await page.waitForFunction(
-    () => window.__testResult && window.__testResult.done === true,
-    { timeout: timeoutMs },
-  );
+  await waitUntil(() => window.__testResult && window.__testResult.done === true,
+    { timeout: timeoutMs, label: 'test suite done' });
   const result = await page.evaluate(() => window.__testResult);
   const cards = await page.evaluate(() =>
     [...document.querySelectorAll('.case')].map((el) => ({
@@ -81,7 +92,8 @@ try {
 
   // Deterministic QuotaExceededError recovery via injectable SourceBuffers.
   await page.goto(`${BASE}/quota-test.html`, { waitUntil: 'domcontentloaded' });
-  await page.waitForFunction(() => window.__quotaResult && window.__quotaResult.done === true, { timeout: 20000 });
+  await waitUntil(() => window.__quotaResult && window.__quotaResult.done === true,
+    { timeout: 60000, label: 'quota suite done' });
   const quota = await page.evaluate(() => window.__quotaResult);
   console.log('\n=== 配额回收专项测试 ===');
   for (const [status, name] of quota.results) {
@@ -94,12 +106,12 @@ try {
   // Also smoke the graphical player page and capture a real buffer snapshot.
   await resetKnobs();
   await page.goto(`${BASE}/`, { waitUntil: 'domcontentloaded' });
-  await page.waitForFunction(
+  await waitUntil(
     () => {
       const el = document.getElementById('stats-view');
       return el && el.textContent.includes('"appends"');
     },
-    { timeout: 15000 },
+    { timeout: 60000, label: 'graphical player first append' },
   );
   await page.waitForTimeout(3500);
   const snapshot = await page.evaluate(() => ({

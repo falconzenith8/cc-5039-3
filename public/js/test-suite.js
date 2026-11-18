@@ -283,6 +283,64 @@ const cases = [
       }
     },
   },
+
+  {
+    // 图形播放器同款路径：拖动进度（seekTo）叠加服务器延迟，核验浏览器真实
+    // 缓冲范围随 seek 迁移、恢复后播放连续，并把任何缓冲/媒体异常留作证据。
+    name: '10. seek 叠加延迟注入：缓冲范围迁移且播放连续（浏览器缓冲证据）',
+    async run() {
+      const p = await freshPlayer({ aheadLimitSec: 6 });
+      const anomalies = [];
+      const onFatal = (f) => anomalies.push(`fatal: ${f.message}`);
+      const onStall = (s) => anomalies.push(`stall@${s.currentTime.toFixed(2)}`);
+      p.on('fatal', onFatal);
+      p.on('stall', onStall);
+      try {
+        await p.play();
+        await waitFor('起步播放', () => p.video.currentTime > 1, { timeout: 12000 });
+
+        // 拖动到 25s 并同时注入下载延迟，模拟图形播放器的 seek+慢网。
+        await postKnobs({ latencyBaseMs: 1500, latencyJitterMs: 500 });
+        const before = p.getRanges();
+        p.seekTo(25);
+        assert(p.state === PlayerState.SEEKING, 'seek 期间应为 SEEKING');
+        await waitFor('25s 附近出现真实浏览器缓冲', () => {
+          const r = p.getRanges();
+          return r.intersection.some((g) => g.start <= 25.1 && g.end >= 25);
+        }, { timeout: 15000 });
+        const during = p.getRanges();
+        // 缓冲区间证据：新交集范围必须覆盖 seek 目标，而不是停留在旧位置。
+        assert(
+          during.intersection.every((g) => g.end > 20) ||
+            during.intersection.some((g) => g.start <= 25.1 && g.end >= 25),
+          'seek 后交集缓冲未迁移到目标窗口: ' + JSON.stringify(during.intersection),
+        );
+        await waitFor('元素完成 seek', () =>
+          !p.video.seeking && Math.abs(p.video.currentTime - 25) < 0.6, { timeout: 10000 });
+
+        // 撤除延迟，核验播放连续性：播放头必须单调前进且无 fatal。
+        await postKnobs({ latencyBaseMs: 0, latencyJitterMs: 0 });
+        await waitFor('seek 后恢复 PLAYING', () =>
+          p.state === PlayerState.PLAYING && p.video.currentTime > 25, { timeout: 15000 });
+        const t0 = p.video.currentTime;
+        await sleep(1600);
+        const t1 = p.video.currentTime;
+        assert(t1 > t0 + 1.0, `恢复后播放头未连续前进: ${t0.toFixed(2)} -> ${t1.toFixed(2)}`);
+
+        const after = p.getRanges();
+        assert(after.playableAhead > 0, '恢复后交集前向可播应 >0');
+        assert(p.state !== PlayerState.ERROR, '不应进入 ERROR');
+        // 媒体错误零容忍；卡顿允许出现（慢网预期），但必须能恢复。
+        const fatalHits = anomalies.filter((a) => a.startsWith('fatal'));
+        assert(fatalHits.length === 0, '出现媒体/fatal 异常: ' + JSON.stringify(fatalHits));
+      } finally {
+        p.off('fatal', onFatal);
+        p.off('stall', onStall);
+        await postKnobs({ latencyBaseMs: 0, latencyJitterMs: 0 });
+        await p.dispose();
+      }
+    },
+  },
 ];
 
 // --------------------------------------------------------------- runner
